@@ -54,7 +54,8 @@ Student Hub is a web application that helps university (science faculty) student
 │  DROPBOX LAYER                                              │
 │  Service: App\Services\DropboxService                       │
 │  • verifyCredentials()   • refreshAccessToken()             │
-│  • ensureValidToken()    • getAccountFiles() + temp links   │
+│  • ensureValidToken()    • validateToken()/getValidToken()  │
+│  • getAccountFiles() + temp links                           │
 │  Scheduled: dropbox:refresh-tokens (every 3h)               │
 │  Accounts: many Dropbox accounts (2 GB each) mapped 1:many  │
 │  to departments; each account = storage bucket              │

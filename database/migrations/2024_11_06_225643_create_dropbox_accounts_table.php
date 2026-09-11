@@ -16,8 +16,9 @@ return new class extends Migration
             $table->string('email');
             $table->string('client_id')->unique();
             $table->string('client_secret')->unique();
-            $table->string('access_token')->nullable();
+            $table->text('access_token')->nullable();
             $table->text('refresh_token');
+            $table->timestamp('token_expires_at')->nullable();
             $table->foreignId('department_id')->nullable()->constrained('departments')->onDelete('set null')->onUpdate('set null');
             $table->bigInteger('remaining_storage')->default(2147483648); // 2GB = 2 * 1024^3 bytes
             $table->timestamps();

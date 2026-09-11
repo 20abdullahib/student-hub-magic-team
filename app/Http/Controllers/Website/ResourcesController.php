@@ -3,13 +3,12 @@
 namespace App\Http\Controllers\Website;
 
 use App\Http\Controllers\Controller;
-use App\Models\File;
 use App\Models\Branch;
-use App\Models\Subject;
 use App\Models\Department;
+use App\Models\File;
+use App\Models\Subject;
 use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
-use Illuminate\Support\Facades\DB;
 
 class ResourcesController extends Controller
 {
@@ -27,36 +26,38 @@ class ResourcesController extends Controller
 
     /**
      * Show the nested folder view for a given subject.
-     *
-     * @param int $id
-     * @param Request $request
      */
     public function show(int $id, Request $request)
     {
         $subject = Subject::with('files')->findOrFail($id);
-        $tree = $this->buildTree($subject->files, true);
+
+        // Leading path segments that mirror the department/subject names:
+        // legacy uploads start with the subject, standardized uploads with
+        // department then subject. Stripping either renders the same tree.
+        $stripPrefixes = array_map(
+            fn ($name) => mb_strtolower(trim((string) $name)),
+            array_filter([$subject->department->name ?? null, $subject->name])
+        );
+
+        $tree = $this->buildTree($subject->files, true, $stripPrefixes);
 
         $currentFolderPath = $request->get('folder', '');
-        $currentNode       = $this->getCurrentNode($tree, $currentFolderPath);
-        $breadcrumbs       = $this->buildBreadcrumbs($subject->id, $currentFolderPath);
+        $currentNode = $this->getCurrentNode($tree, $currentFolderPath);
+        $breadcrumbs = $this->buildBreadcrumbs($subject->id, $currentFolderPath);
 
         return view('website.pages.resource.partials.nested-folders', array_merge([
-            'subject'           => $subject,
-            'tree'              => $tree,
-            'currentNode'       => $currentNode,
+            'subject' => $subject,
+            'tree' => $tree,
+            'currentNode' => $currentNode,
             'currentFolderPath' => $currentFolderPath,
-            'breadcrumbs'       => $breadcrumbs,
+            'breadcrumbs' => $breadcrumbs,
         ], $this->getDepartmentAndBranchData()));
     }
 
     /**
      * Build a nested tree from a flat list of files.
-     *
-     * @param Collection $files
-     * @param bool $removeFirstFolder
-     * @return array
      */
-    private function buildTree(Collection $files, bool $removeFirstFolder = false): array
+    private function buildTree(Collection $files, bool $removeFirstFolder = false, array $stripPrefixes = []): array
     {
         $tree = [];
 
@@ -66,6 +67,7 @@ class ResourcesController extends Controller
             // File is in the root directory.
             if ($trimmedPath === '') {
                 $tree['_files'][] = $file;
+
                 continue;
             }
 
@@ -75,9 +77,24 @@ class ResourcesController extends Controller
                 array_shift($parts);
             }
 
+            // Strip mirrored department/subject leading segments (standardized
+            // /{Department}/{Subject}/... paths) so both old (/Subject/...)
+            // and new uploads render the same per-subject folder tree.
+            if (! empty($stripPrefixes)) {
+                foreach ($parts as $i => $part) {
+                    if (in_array(mb_strtolower(trim($part)), $stripPrefixes, true)) {
+                        unset($parts[$i]);
+                    } else {
+                        break;
+                    }
+                }
+                $parts = array_values($parts);
+            }
+
             // If no folder remains or just one part remains, treat the file as in the root.
             if (count($parts) <= 1) {
                 $tree['_files'][] = $file;
+
                 continue;
             }
 
@@ -86,7 +103,7 @@ class ResourcesController extends Controller
             $current = &$tree;
 
             foreach ($folderParts as $folder) {
-                if (!isset($current[$folder])) {
+                if (! isset($current[$folder])) {
                     $current[$folder] = [];
                 }
                 $current = &$current[$folder];
@@ -100,10 +117,6 @@ class ResourcesController extends Controller
 
     /**
      * Retrieve the tree node corresponding to the current folder path.
-     *
-     * @param array $tree
-     * @param string $folderPath
-     * @return array
      */
     private function getCurrentNode(array $tree, string $folderPath): array
     {
@@ -124,27 +137,23 @@ class ResourcesController extends Controller
 
     /**
      * Build breadcrumb links for navigation.
-     *
-     * @param int $subjectId
-     * @param string $folderPath
-     * @return array
      */
     private function buildBreadcrumbs(int $subjectId, string $folderPath): array
     {
         $breadcrumbs = [
             [
                 'label' => 'Resources',
-                'url'   => route('resources.index', $subjectId),
+                'url' => route('resources.index', $subjectId),
             ],
         ];
 
         if ($folderPath !== '') {
             $accumulated = '';
             foreach (explode('/', $folderPath) as $part) {
-                $accumulated .= ($accumulated ? '/' : '') . $part;
+                $accumulated .= ($accumulated ? '/' : '').$part;
                 $breadcrumbs[] = [
                     'label' => $part,
-                    'url'   => route('resources.subjects.show', $subjectId) . '?folder=' . urlencode($accumulated),
+                    'url' => route('resources.subjects.show', $subjectId).'?folder='.urlencode($accumulated),
                 ];
             }
         }
@@ -158,7 +167,7 @@ class ResourcesController extends Controller
     public function search(Request $request)
     {
         $query = $request->input('query', '');
-        
+
         $subjects = $this->getSubjectsQuery($query)->paginate(20);
 
         return $this->handleResponse($request, $subjects, ['query' => $query]);
@@ -170,34 +179,34 @@ class ResourcesController extends Controller
     public function suggestions(Request $request)
     {
         $query = $request->input('query', '');
-        
+
         if (empty($query)) {
             // For testing, return some subjects even without query
             $subjects = Subject::whereHas('files')
                 ->select('id', 'name', 'code', 'description')
                 ->limit(5)
                 ->get();
-                
+
             return response()->json([
                 'data' => $subjects,
                 'count' => $subjects->count(),
-                'message' => 'No query provided - showing sample subjects'
+                'message' => 'No query provided - showing sample subjects',
             ]);
         }
 
-        $subjects = Subject::where(function($q) use ($query) {
+        $subjects = Subject::where(function ($q) use ($query) {
             $q->where('name', 'LIKE', "%{$query}%")
-              ->orWhere('code', 'LIKE', "%{$query}%");
+                ->orWhere('code', 'LIKE', "%{$query}%");
         })
-        ->whereHas('files')
-        ->select('id', 'name', 'code', 'description')
-        ->limit(10)
-        ->get();
+            ->whereHas('files')
+            ->select('id', 'name', 'code', 'description')
+            ->limit(10)
+            ->get();
 
         return response()->json([
             'data' => $subjects,
             'count' => $subjects->count(),
-            'query' => $query
+            'query' => $query,
         ]);
     }
 
@@ -217,36 +226,32 @@ class ResourcesController extends Controller
 
     /**
      * Redirect to the Dropbox preview URL for a file.
-     *
-     * @param string $fileId
      */
     public function preview(string $fileId)
     {
         $file = File::where('file_id', $fileId)->firstOrFail();
+
         return redirect($this->getDropboxLink($file, 0));
     }
 
     /**
      * Redirect to the Dropbox download URL for a file.
-     *
-     * @param string $fileId
      */
     public function download(string $fileId)
     {
         $file = File::where('file_id', $fileId)->firstOrFail();
+
         return redirect($this->getDropboxLink($file, 1));
     }
 
     /**
      * Build the Dropbox URL for preview or download.
      *
-     * @param File $file
-     * @param int $downloadFlag 0 for preview, 1 for download.
-     * @return string
+     * @param  int  $downloadFlag  0 for preview, 1 for download.
      */
     private function getDropboxLink(File $file, int $downloadFlag): string
     {
-        if (!$file->rlkey) {
+        if (! $file->rlkey) {
             abort(404, 'Shared link is not available for this file.');
         }
 
@@ -255,23 +260,21 @@ class ResourcesController extends Controller
 
     /**
      * Retrieve common data for departments and branches.
-     *
-     * @return array
      */
     private function getDepartmentAndBranchData(): array
     {
         return [
             'departments' => Department::all(),
-            'branches'    => Branch::all(),
+            'branches' => Branch::all(),
         ];
     }
 
     /**
      * Build a reusable query for subjects with files.
-     * 
-     * @param string|null $searchQuery
-     * @param string|null $departmentId
-     * @param string|null $branchId
+     *
+     * @param  string|null  $searchQuery
+     * @param  string|null  $departmentId
+     * @param  string|null  $branchId
      * @return \Illuminate\Database\Eloquent\Builder
      */
     private function getSubjectsQuery($searchQuery = null, $departmentId = null, $branchId = null)
@@ -279,14 +282,14 @@ class ResourcesController extends Controller
         $query = Subject::with(['files' => function ($q) {
             $q->orderBy('path');
         }])
-        ->whereHas('files')
-        ->withCount('files');
+            ->whereHas('files')
+            ->withCount('files');
 
         // Apply search filter
-        if (!empty($searchQuery)) {
-            $query->where(function($q) use ($searchQuery) {
+        if (! empty($searchQuery)) {
+            $query->where(function ($q) use ($searchQuery) {
                 $q->where('name', 'LIKE', "%{$searchQuery}%")
-                  ->orWhere('code', 'LIKE', "%{$searchQuery}%");
+                    ->orWhere('code', 'LIKE', "%{$searchQuery}%");
             });
         }
 
@@ -294,24 +297,24 @@ class ResourcesController extends Controller
         // If both department and branch are provided, return subjects that match
         // either the department OR the branch to avoid overly restrictive AND logic.
         // Use grouping to prevent duplicate subjects when a subject matches both.
-        if (!empty($departmentId) && !empty($branchId)) {
-            $query->where(function($q) use ($departmentId, $branchId) {
+        if (! empty($departmentId) && ! empty($branchId)) {
+            $query->where(function ($q) use ($departmentId, $branchId) {
                 $q->where('department_id', $departmentId)
-                  ->orWhereHas('branches', function($q2) use ($branchId) {
-                      $q2->where('branches.id', $branchId);
-                  });
+                    ->orWhereHas('branches', function ($q2) use ($branchId) {
+                        $q2->where('branches.id', $branchId);
+                    });
             });
 
             // Prevent duplicate rows in case of joins
             $query->groupBy('subjects.id');
 
-        } elseif (!empty($departmentId)) {
+        } elseif (! empty($departmentId)) {
             // Only department provided
             $query->where('department_id', $departmentId);
 
-        } elseif (!empty($branchId)) {
+        } elseif (! empty($branchId)) {
             // Only branch provided
-            $query->whereHas('branches', function($q) use ($branchId) {
+            $query->whereHas('branches', function ($q) use ($branchId) {
                 $q->where('branches.id', $branchId);
             });
         }
@@ -324,10 +327,8 @@ class ResourcesController extends Controller
 
     /**
      * Handle the response for both AJAX and regular requests.
-     * 
-     * @param Request $request
-     * @param \Illuminate\Contracts\Pagination\LengthAwarePaginator $subjects
-     * @param array $extraData
+     *
+     * @param  \Illuminate\Contracts\Pagination\LengthAwarePaginator  $subjects
      * @return \Illuminate\Http\JsonResponse|\Illuminate\View\View
      */
     private function handleResponse(Request $request, $subjects, array $extraData = [])

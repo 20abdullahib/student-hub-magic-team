@@ -3,11 +3,7 @@
         {{-- <div class="col-12 col-md-4 col-xl-6 mb-4 mb-md-0"> --}}
         <div>
             <p class="mb-0 text-center text-lg-start">©
-                <span class="current-year">
-                    <script>
-                        document.getElementById("copyright2").appendChild(document.createTextNode(new Date().getFullYear()));
-                    </script>
-                </span>
+                <span class="current-year" id="copyright2"></span>
                 <a class="text-primary fw-normal" href="https://www.facebook.com/profile.php?id=100063552707517" target="_blank">Magic-Team Mentor. All Rights Reserved.
                 </a>
             </p>

@@ -1,6 +1,6 @@
 # 03 — Database
 
-MySQL database. All schema is created by 15 migrations in `database/migrations/`.
+MySQL database. All schema is created by migrations in `database/migrations/`.
 
 ## Migration List
 
@@ -20,6 +20,7 @@ MySQL database. All schema is created by 15 migrations in `database/migrations/`
 | `2024_11_27_112214_create_files_table.php` | `files` (FK → subjects, dropbox_accounts, cascade) |
 | `2025_02_06_061335_create_admins_table.php` | `admins` (FKs → departments/branches, `restrict` on delete) |
 | `2025_02_08_015335_create_permission_tables.php` | Spatie tables: `roles`, `permissions`, `model_has_permissions`, `model_has_roles`, `role_has_permissions` |
+| `2026_09_11_000000_fix_dropbox_accounts_token_columns.php` | `dropbox_accounts`: `access_token` VARCHAR(255) → TEXT (Dropbox `sl.u.` tokens are ~1500–2000 chars; the old column made every save fail with MySQL 1406 and left `access_token` NULL), creates missing `token_expires_at` (guarded with `hasColumn`) |
 
 ## Domain Tables
 
@@ -76,13 +77,14 @@ MySQL database. All schema is created by 15 migrations in `database/migrations/`
 | email | VARCHAR | Dropbox account email |
 | client_id | VARCHAR UNIQUE | Dropbox app key |
 | client_secret | VARCHAR UNIQUE | Dropbox app secret |
-| access_token | VARCHAR | nullable — short-lived, refreshed automatically |
+| access_token | TEXT | nullable — short-lived (~1500–2000 chars), refreshed automatically; saved at setup time and by every refresh |
 | refresh_token | TEXT | long-lived OAuth refresh token |
 | department_id | BIGINT FK → departments.id | nullable |
 | remaining_storage | BIGINT | default 2147483648 (2 GB) |
+| token_expires_at | TIMESTAMP | nullable — token expiry, set at setup and on every refresh |
 | timestamps | | |
 
-> Note: the model also casts `token_expires_at` (used by `DropboxService`), but the migration does **not** create it — see *Known Gaps*.
+> Note: `access_token` must stay TEXT — never shrink it back to VARCHAR or saves will fail silently (logged as MySQL 1406).
 
 ### `files` (metadata only — bytes live in Dropbox)
 | Column | Type | Notes |
@@ -138,6 +140,6 @@ erDiagram
 
 ## Known Gaps / Gotchas
 
-- `DropboxService` reads/writes `token_expires_at` on `dropbox_accounts`, but the migration `2024_11_06_225643_create_dropbox_accounts_table.php` does **not** define that column — the live DB must have it (added manually or via a missing migration). If you hit "column not found", add a migration for `token_expires_at`.
+- ~~`DropboxService` reads/writes `token_expires_at` on `dropbox_accounts`, but the migration does **not** define that column~~ **Fixed 2026-09-11:** migration `2026_09_11_000000_fix_dropbox_accounts_token_columns.php` creates it (and widens `access_token` to TEXT). The column previously existed only on manually-patched live DBs, which is also why token saves were failing.
 - `files.file_id`/`rlkey` are nullable in the schema but validated as required in `storeFileDetails()` — the upload JS must always send them.
 

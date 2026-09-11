@@ -26,8 +26,11 @@ class RefreshDropboxTokens extends Command
      */
     public function handle()
     {
-        $dropboxController = new DropboxController();
+        // Resolve through the container so constructor DI (DropboxService) works;
+        // plain `new DropboxController()` would throw ArgumentCountError.
+        $dropboxController = app(DropboxController::class);
         $dropboxController->refreshAllTokens();
 
-        $this->info('All Dropbox access tokens have been refreshed successfully.');    }
+        $this->info('All Dropbox access tokens have been refreshed successfully.');
+    }
 }

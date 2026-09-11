@@ -7,8 +7,8 @@ use App\Models\Department;
 use App\Models\DropboxAccount;
 use App\Models\File;
 use App\Models\Subject;
-use Illuminate\Http\Request;
 use App\Services\DropboxService;
+use Illuminate\Http\Request;
 
 class DropboxController extends Controller
 {
@@ -49,7 +49,7 @@ class DropboxController extends Controller
     public function showForm()
     {
         return view('dashboard.pages.dropbox.AddNewAccount', [
-            'departments' => Department::all()
+            'departments' => Department::all(),
         ]);
     }
 
@@ -63,7 +63,12 @@ class DropboxController extends Controller
             'department_id' => 'required|exists:departments,id',
         ]);
 
-        if (!$this->dropboxService->verifyCredentials($validated)) {
+        // Exchanges the refresh token for a fresh access token and returns the
+        // payload so it can be stored right away — access_token/token_expires_at
+        // must never stay NULL after a successful setup.
+        $tokenData = $this->dropboxService->verifyCredentials($validated);
+
+        if ($tokenData === null) {
             return redirect()->back()
                 ->withInput()
                 ->with('error', 'Invalid Dropbox credentials');
@@ -71,7 +76,10 @@ class DropboxController extends Controller
 
         DropboxAccount::updateOrCreate(
             ['email' => $validated['email']],
-            $validated
+            array_merge($validated, [
+                'access_token' => $tokenData['access_token'],
+                'token_expires_at' => now()->addSeconds($tokenData['expires_in']),
+            ])
         );
 
         return redirect()->back()->with('success', 'Account setup successful');
@@ -99,6 +107,7 @@ class DropboxController extends Controller
         $admin = auth('admin')->user();
         $departments = Department::all();
         $subjects = Subject::all();
+
         return view('dashboard.pages.dropbox.UploadFiles', compact('admin', 'departments', 'subjects'));
     }
 
@@ -142,21 +151,29 @@ class DropboxController extends Controller
             'departments' => Department::all(),
         ]);
     }
+
     public function deleteFiles(File $file)
     {
         $file->delete();
+
         return response()->json(['success' => true]);
     }
 
     public function getAccountForUpload(Request $request)
     {
-        $subject = Subject::findOrFail($request->subject_id);
+        $subject = Subject::with('department')->findOrFail($request->subject_id);
 
         $accounts = DropboxAccount::where('department_id', $subject->department_id)
             ->get()
             ->map(function ($account) {
                 $this->dropboxService->ensureValidToken($account);
-                return $account->only(['id', 'name', 'department_id']);
+
+                return [
+                    'id' => $account->id,
+                    'email' => $account->email,
+                    'department_id' => $account->department_id,
+                    'department_name' => $subject->department->name ?? null,
+                ];
             });
 
         return response()->json($accounts);
@@ -168,6 +185,7 @@ class DropboxController extends Controller
 
         $fileLinks = $department->dropboxAccounts->flatMap(function ($account) {
             $this->dropboxService->ensureValidToken($account);
+
             return $this->dropboxService->getAccountFiles($account);
         });
 
@@ -187,8 +205,18 @@ class DropboxController extends Controller
     public function getAccessToken(Request $request)
     {
         $account = DropboxAccount::findOrFail($request->account_id);
-        $this->dropboxService->ensureValidToken($account);
 
-        return response()->json(['access_token' => $account->access_token]);
+        // Validate the token live; the stored token can be dead even when
+        // token_expires_at is still in the future (silent refresh failure,
+        // revoked session, regenerated refresh token, ...).
+        if ($this->dropboxService->getValidToken($account)) {
+            return response()->json(['access_token' => $account->access_token]);
+        }
+
+        // Do not hand out a broken token — tell the JS exactly which account is broken.
+        return response()->json([
+            'error' => "Dropbox account {$account->email} could not provide a valid access token. Re-link it in Dashboard → Dropbox accounts (the refresh token may have been revoked).",
+            'account_id' => $account->id,
+        ], 502);
     }
 }

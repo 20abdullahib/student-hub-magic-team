@@ -33,7 +33,13 @@ const DropboxService = (() => {
     },
 
     uploadFile: async (file, filePath) => {
-      return client.filesUpload({ path: filePath, contents: file });
+      // mode 'overwrite' → retrying a failed upload (e.g. shared-link error)
+      // replaces the file instead of failing with a 409 conflict.
+      return client.filesUpload({
+        path: filePath,
+        contents: file,
+        mode: { '.tag': 'overwrite' },
+      });
     },
 
     uploadLargeFile: async (file, filePath) => {
@@ -59,26 +65,39 @@ const DropboxService = (() => {
 
       return client.filesUploadSessionFinish({
         cursor: { session_id: sessionId, offset: fileSize },
-        commit: { path: filePath, mode: 'add', autorename: true, mute: false },
+        commit: {
+          path: filePath,
+          mode: { '.tag': 'overwrite' },
+          autorename: false,
+          mute: false,
+        },
       });
     },
 
     createSharedLink: async (filePath) => {
+      const describe = (error) =>
+        error?.error?.error_summary || error?.error || error?.message || String(error);
+
       try {
+        // Create with DEFAULT settings first — most compatible: requesting
+        // 'public' visibility explicitly can 400 on account/app configurations
+        // that restrict it, and defaults are usually public anyway.
         const response = await client.sharingCreateSharedLinkWithSettings({
           path: filePath,
-          settings: { requested_visibility: 'public' }
         });
         return response.result;
       } catch (error) {
         if (error.status === 409) {
-          const response = await client.sharingListSharedLinks({ 
+          // Link already exists for this path → fetch it.
+          const response = await client.sharingListSharedLinks({
             path: filePath,
-            direct_only: true
+            direct_only: true,
           });
           return response.result.links[0] || null;
         }
-        throw error;
+        // e.g. missing scope: "Your app ... does not have the required scope
+        // 'sharing.write'" → surface the exact Dropbox reason, not a bare 400.
+        throw new Error(`Dropbox: ${describe(error)}`);
       }
     },
 
@@ -94,13 +113,29 @@ const DropboxService = (() => {
 
 // Service: Network Requests
 const NetworkService = (() => {
+  // Error that must NOT be retried (4xx — bad token, validation, permissions...).
+  class FatalRequestError extends Error {}
+
   const fetchWithRetry = async (url, options, retries = 3) => {
     for (let i = 0; i < retries; i++) {
       try {
         const response = await fetch(url, options);
         if (response.ok) return response;
-        if (response.status === 401) throw new Error('Unauthorized');
+
+        let message = `Request failed with ${response.status}`;
+        try {
+          const body = await response.json();
+          message = body?.error || body?.message || message;
+        } catch (_) { /* body was not JSON */ }
+
+        // 4xx (except 429) won't succeed on retry — fail immediately with the real reason.
+        if (response.status >= 400 && response.status < 500 && response.status !== 429) {
+          throw new FatalRequestError(message);
+        }
+
+        throw new Error(message);
       } catch (error) {
+        if (error instanceof FatalRequestError) throw error;
         if (i === retries - 1) throw error;
         await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
       }
@@ -202,6 +237,32 @@ const FileListManager = (() => {
   };
 })();
 
+// Sanitize a single Dropbox path segment: trim and drop characters that are
+// illegal in file/folder names (subject names are Arabic — Unicode is fine,
+// only separators like / \ : ? * " < > | are dangerous).
+const sanitizePathSegment = (segment) =>
+  String(segment ?? '')
+    .replace(/[\\/:?*"<>|]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+// Standardized upload structure: /{Department}/{Subject}/[subfolders]/{file}
+const buildDropboxPath = (departmentName, subjectName, relativePath, fileName) => {
+  const subFolders = String(relativePath ?? '')
+    .split('/')
+    .map(sanitizePathSegment)
+    .filter(Boolean);
+
+  const segments = [
+    sanitizePathSegment(departmentName),
+    sanitizePathSegment(subjectName),
+    ...subFolders,
+    sanitizePathSegment(fileName),
+  ].filter(Boolean);
+
+  return '/' + segments.join('/');
+};
+
 // Controller: Upload Management
 const UploadController = (() => {
   const updateAccountSpace = async (client, accountId) => {
@@ -217,19 +278,38 @@ const UploadController = (() => {
   };
 
   const selectAccountWithSpace = async (accounts, requiredSize) => {
+    const failures = [];
+    let spaceChecked = false;
+
     for (const account of accounts) {
+      const label = account.email || `#${account.id}`;
       try {
         const accessToken = await NetworkService.getAccessToken(account.id);
         const client = DropboxService.initializeClient(accessToken);
         const { allocated, used } = await DropboxService.getSpaceUsage();
-        
-        if ((allocated - used) >= requiredSize) {
+        spaceChecked = true;
+
+        if (allocated - used >= requiredSize) {
           return { account, accessToken };
         }
+
+        console.warn(`Account ${label}: only ${allocated - used} bytes free, ${requiredSize} needed`);
       } catch (error) {
-        console.error(`Account check failed for ${account.id}:`, error);
+        failures.push(`Account ${label}: ${error.message}`);
+        console.error(`Account check failed for ${label}:`, error);
       }
     }
+
+    // Every account failed its check (invalid token, missing scope, ...) —
+    // report the real reasons instead of the misleading "Insufficient space".
+    if (failures.length === accounts.length) {
+      throw new Error(failures.join(' | '));
+    }
+    if (!spaceChecked) {
+      throw new Error(failures.join(' | ') || 'No Dropbox account could be checked');
+    }
+
+    // At least one account was checked fine but none had enough free space.
     return null;
   };
 
@@ -237,13 +317,23 @@ const UploadController = (() => {
     const accounts = await NetworkService.getAvailableAccounts(subjectId);
     if (!accounts.length) throw new Error('No available accounts');
 
-    const accountInfo = await selectAccountWithSpace(accounts, file.size);
-    if (!accountInfo) throw new Error('Insufficient space');
+    let accountInfo;
+    try {
+      accountInfo = await selectAccountWithSpace(accounts, file.size);
+    } catch (error) {
+      // All accounts failed their space/token checks — surface the real reason.
+      throw new Error(`Upload aborted — ${error.message}`);
+    }
+    if (!accountInfo) {
+      const mb = (file.size / (1024 * 1024)).toFixed(1);
+      throw new Error(`Insufficient space: no Dropbox account of this department has ${mb} MB free`);
+    }
 
     const { account, accessToken } = accountInfo;
     const client = DropboxService.initializeClient(accessToken);
-    const cleanPath = relativePath.replace(/^\/|\/$/g, '');
-    const filePath = `/${subjectName}/${cleanPath ? `${cleanPath}/` : ''}${file.name}`;
+    const departmentName = account.department_name || accounts[0]?.department_name || '';
+    // Standardized structure: /Department/Subject/[subfolders]/file
+    const filePath = buildDropboxPath(departmentName, subjectName, relativePath, file.name);
 
     try {
       FileListManager.updateStatus(file, 'Uploading...');
@@ -270,8 +360,9 @@ const UploadController = (() => {
       FileListManager.updateStatus(file, 'Uploaded ✔️');
       return true;
     } catch (error) {
-      console.error(`Upload failed for ${file.name}:`, error);
-      FileListManager.updateStatus(file, 'Failed ❌');
+      const summary = error.message || String(error);
+      console.error(`Upload failed for ${file.name}:`, summary, error);
+      FileListManager.updateStatus(file, `Failed ❌ ${summary.slice(0, 140)}`);
       return false;
     } finally {
       FileListManager.removeFileItem(file);
